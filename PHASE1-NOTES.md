@@ -95,6 +95,6 @@ sizes (incl. clamp paths). Vision tensors: 861 MiB as loaded.
 
 ## LOC
 
-- `vision.py` 254 lines (incl. module docstring); `vision_parity.py` 138; both committed on branch
+- `vision.py` 206 lines (incl. module docstring); `vision_parity.py` 138; both committed on branch
   `flashnext-vision` (GB10 fork `/home/bot/hibana-vision-fork`, claw mirror `~/research/hibana-vision-fork`).
   Nothing pushed anywhere.
