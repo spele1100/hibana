@@ -1,24 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """The Flash-Next checkpoint's image path (`hibana/model/flashnext`): the Qwen3-VL vision tower behind the Qwen4Exp
-multimodal wrapper — a 27-block ViT of width 1152 (16 heads, head_dim 72) over 16-pixel patches, 2 x 2 patch blocks
-merged per token, and the `merger` projector into the language model's 2560-wide embedding space.
+multimodal wrapper — a 27-block ViT of width 1152 (16 heads, head_dim 72) over 16-pixel patches with full per-frame
+attention (no windows), 2 x 2 patch blocks merged per token, and the `merger` projector into the language model's
+2560-wide embedding space.
 
-`preprocess` smart-resizes each image to 32-pixel-aligned sides between 65,536 and 16,777,216 pixels (the checkpoint's
-`preprocessor_config.json`: factor = patch 16 x merge 2, bicubic antialiased resize, mean/std 0.5), then layes out its
-patches in raster order. `QwenVision.encode` folds the reference's Conv3d patch embedding (temporal kernel 2, fed the
-frame twice for images) into one Linear, adds the learned 48 x 48 position table resampled to the patch grid
-(bilinear, corners aligned), runs the blocks with per-frame full attention under axial 2-D rotary (theta 10,000, h and
-w frequencies interleaved over the whole head as HF lays them out), and merges each 2 x 2 patch block with
-LayerNorm(1152) -> fc1 4608 -> erf-GELU -> fc2 2560. The reference (`transformers` 5.15.1 `qwen3_vl`, which
-`Qwen4ExpVisionModel` upstream copies and vLLM's flash-next model inherits) instead feeds the tower patches in
-spatial-merge-block order and merges with a plain reshape; full per-frame attention is permutation-equivariant, so the
-raster layout with coordinates matching each patch gives the same embeddings (proven to < 1e-2 by
-`tools/vision_parity.py`). An image of (h x w) patches becomes h * w / 4 embeddings, which replace the
+`preprocess` smart-resizes each image to 32-pixel-aligned sides between 65,536 and 16,777,216 pixels (the
+checkpoint's `preprocessor_config.json`: factor = patch 16 x merge 2, bicubic antialiased resize, mean/std 0.5).
+`QwenVision.encode` runs the reference's (`transformers` 5.15.1 `qwen3_vl`, which upstream `Qwen4ExpVisionModel`
+copies and vLLM's flash-next model inherits) exact arithmetic on its exact bits: patches in spatial-merge-block
+order, the Conv3d patch embedding over the frame duplicated along its temporal axis, the learned 48 x 48 position
+table resampled per patch (bilinear, corners aligned, four taps summed in FP32 with a true tensor division — a
+scalar divisor would multiply by the FP32 reciprocal and drift an ulp), axial 2-D rotary (theta 10,000) with BF16
+frequencies and angles exactly as the module's BF16 cast keeps them, sdpa full attention per frame, and the merger's
+LayerNorm(1152) -> fc1 4608 -> erf GELU -> fc2 2560. Proven bit-identical to the reference on the RadixArk
+checkpoint by `tools/vision_parity.py`. An image of (h x w) patches becomes h * w / 4 embeddings, which replace the
 `<|image_pad|>` placeholders the API inserts between `<|vision_start|>` and `<|vision_end|>`. Weights are the
-checkpoint's BF16 `model.visual.*` tensors (about 0.9 GiB); the arithmetic follows the reference modules in BF16 with
-FP32 norms and rotary products.
+checkpoint's BF16 `model.visual.*` tensors (about 0.9 GiB); FP32 norms, rotary products and position sums, as there.
 """
-
 from __future__ import annotations
 
 import math
@@ -105,8 +103,7 @@ class QwenVision:
         self.device = device
         # The reference's Conv3d [1152, 3, 2, 16, 16] reads each image's frame twice (temporal_patch_size 2); folded
         # into one [1152, 3 * 16 * 16] Linear over the frame. Raster patch layout matches the folded input.
-        proj = get(f"{m}.patch_embed.proj.weight")
-        self.patch = proj.sum(dim=2).reshape(WIDTH, 3 * PATCH * PATCH)  # sums the two temporal slices
+        self.patch = get(f"{m}.patch_embed.proj.weight")  # [1152, 3, 2, 16, 16] conv3d, kept as the reference has it
         self.patch_bias = get(f"{m}.patch_embed.proj.bias")
         self.pos = get(f"{m}.pos_embed.weight").reshape(POS_GRID, POS_GRID, WIDTH).float()  # [48, 48, 1152]
         names = ("norm1.weight", "norm1.bias", "attn.qkv.weight", "attn.qkv.bias", "attn.proj.weight", "attn.proj.bias",
@@ -117,10 +114,12 @@ class QwenVision:
         self.m_fc1_w, self.m_fc1_b = get(f"{m}.merger.linear_fc1.weight"), get(f"{m}.merger.linear_fc1.bias")
         self.m_fc2_w, self.m_fc2_b = get(f"{m}.merger.linear_fc2.weight"), get(f"{m}.merger.linear_fc2.bias")
         self.head_dim = WIDTH // HEADS
+        # BF16 frequencies and angles: the reference's `to(dtype)` casts its module buffer, so cos/sin are BF16
+        # values; the rotary products themselves run in FP32 (BF16 angles at large grids shift cos by ~0.1)
         inv_freq = 1.0 / (ROPE_THETA ** (torch.arange(0, self.head_dim // 2, 2, dtype=torch.float32,
                                                       device=device) / (self.head_dim // 2)))  # 18 frequencies
-        self.inv_freq = inv_freq
-        if self.patch.shape != (WIDTH, 3 * PATCH * PATCH) or self.pos.shape != (POS_GRID, POS_GRID, WIDTH) \
+        self.inv_freq = inv_freq.to(torch.bfloat16)
+        if self.patch.shape != (WIDTH, 3, TEMPORAL, PATCH, PATCH) or self.pos.shape != (POS_GRID, POS_GRID, WIDTH) \
                 or self.m_fc1_w.shape != (MERGER_HIDDEN, MERGER_HIDDEN) \
                 or self.m_fc2_w.shape != (OUT_WIDTH, MERGER_HIDDEN):
             raise ValueError("unexpected vision tower shapes")
@@ -132,53 +131,76 @@ class QwenVision:
                    self.m_fc2_w, self.m_fc2_b, *(t for b in self.blocks for t in b)]
         return sum(t.numel() * t.element_size() for t in tensors)
 
-    def _pos_embeds(self, rows: int, cols: int) -> torch.Tensor:
-        """The learned 48 x 48 table resampled (bilinear, corners aligned) to a rows x cols patch grid,
-        [rows * cols, WIDTH] FP32. The reference gathers four taps per patch and sums them; one bilinear kernel writes
-        the same values (align_corners matches its scale)."""
-        pos = self.pos.permute(2, 0, 1).unsqueeze(0)  # [1, 1152, 48, 48]
-        interp = F.interpolate(pos, size=(rows, cols), mode="bilinear", align_corners=True)
-        return interp[0].flatten(1).t()
+    def _pos_embeds(self, r: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """The learned 48 x 48 table resampled (bilinear, corners aligned) at each patch's (row, col) — the
+        reference's own arithmetic: four taps a patch, BF16 table rows times FP32 weights, summed in FP32.
+        `r` and `c` are the patches' coordinates as the sequence orders them."""
+        side = POS_GRID
+        def taps(idx: torch.Tensor, size: int) -> tuple[torch.Tensor, torch.Tensor]:
+            src = (idx.float() * (side - 1)) / torch.tensor(max(size - 1, 1), device=idx.device)  # true division,
+            # as the reference (a tensor divisor): `x / int` multiplies by the FP32 reciprocal and rounds twice
+            floor = src.floor().long()
+            return torch.stack([floor, (floor + 1).clamp(max=side - 1)], dim=1), torch.stack(
+                [1 - (src - floor), (src - floor).clamp(max=1.0)], dim=1)
+        ht, hw = taps(r, int(r.max()) + 1)
+        wt, ww = taps(c, int(c.max()) + 1)
+        idx = (ht[:, :, None] * side + wt[:, None, :]).reshape(-1, 4)
+        w = (hw[:, :, None] * ww[:, None, :]).reshape(-1, 4)
+        return (self.pos.flatten(0, 1)[idx] * w[:, :, None]).sum(1)  # the reference's own gather-and-sum
 
-    def _cos_sin(self, rows: int, cols: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Axial rotary cos/sin for a rows x cols raster grid, [rows * cols, head_dim] FP32 each: 18 h-frequencies then
-        18 w-frequencies, the whole head rotated (the reference concatenates the same halves twice)."""
-        h = torch.arange(rows, device=self.device, dtype=torch.float32).repeat_interleave(cols)  # row per patch
-        w = torch.arange(cols, device=self.device, dtype=torch.float32).repeat(rows)  # column per patch
-        freqs = torch.stack([h, w], dim=-1)[..., None] * self.inv_freq  # [N, 2, 18]
-        freqs = freqs.flatten(1)  # [N, 36]
-        emb = torch.cat([freqs, freqs], dim=-1)  # [N, 72]: h-freqs, w-freqs, repeated over the head's halves
+    def _cos_sin(self, r: torch.Tensor, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Axial rotary cos/sin for each patch's (row, column), [N, head_dim] BF16 each: 18 h-frequencies then 18
+        w-frequencies, the whole head rotated (the reference concatenates the same halves twice). The int64 x BF16
+        product keeps the reference's BF16 angles."""
+        pid = torch.stack([r, c], dim=-1)  # [N, 2]
+        freqs = (pid[..., None] * self.inv_freq).flatten(1)  # [N, 36]
+        emb = torch.cat([freqs, freqs], dim=-1)  # [N, 72]
         return emb.cos(), emb.sin()
 
     @torch.inference_mode()
     def encode(self, pixels: torch.Tensor) -> torch.Tensor:
-        """An image [3, H, W] (`preprocess`, H and W multiples of 32) -> [H/16 * W/16 / 4, 2560] BF16 embeddings."""
+        """An image [3, H, W] (`preprocess`, H and W multiples of 32) -> [H/16 * W/16 / 4, 2560] BF16 embeddings.
+        Patches run in the reference's spatial-merge-block order ((block row, block column, row, column) within the
+        grid), so every kernel sees the reference's own bits and the embeddings match it bitwise."""
         x = pixels.to(self.device, torch.bfloat16)
         rows, cols = x.shape[1] // PATCH, x.shape[2] // PATCH
-        patches = x.reshape(3, rows, PATCH, cols, PATCH).permute(1, 3, 0, 2, 4).reshape(rows * cols, -1)
-        h = F.linear(patches, self.patch, self.patch_bias) + self._pos_embeds(rows, cols).to(torch.bfloat16)
-        cos, sin = self._cos_sin(rows, cols)
+        # (C, h/2, 2, 16, w/2, 2, 16) -> (h/2, w/2, 2, 2, C, 16, 16): the processor's own patch layout
+        patches = x.reshape(3, rows // MERGE, MERGE, PATCH, cols // MERGE, MERGE, PATCH) \
+            .permute(1, 4, 2, 5, 0, 3, 6).reshape(-1, 3, PATCH, PATCH)
+        patches = patches[:, :, None].expand(-1, 3, TEMPORAL, PATCH, PATCH).contiguous()  # frame in both T slices
+        h = F.conv3d(patches, self.patch, self.patch_bias).reshape(-1, WIDTH) \
+            + self._pos_embeds(*self._coords(rows, cols)).to(torch.bfloat16)
+        cos, sin = self._cos_sin(*self._coords(rows, cols))
         t, d = h.shape[0], self.head_dim
         for n1w, n1b, qkv_w, qkv_b, proj_w, proj_b, n2w, n2b, fc1_w, fc1_b, fc2_w, fc2_b in self.blocks:
-            qkv = F.linear(F.layer_norm(h, (WIDTH,), n1w, n1b, LN_EPS), qkv_w, qkv_b).view(t, 3, HEADS, d).permute(1, 2, 0, 3)
-            q, k = qkv[0:1], qkv[1:2]
-            qf, kf = q.float(), k.float()  # rotary products in FP32, as the reference keeps them
-            cos_h, sin_h = cos.unsqueeze(1), sin.unsqueeze(1)  # [t, 1, d]
-            half = d // 2
-            rot = lambda v: torch.cat((-v[..., half:], v[..., :half]), dim=-1)
-            q = (qf * cos_h + rot(qf) * sin_h).to(torch.bfloat16)
-            k = (kf * cos_h + rot(kf) * sin_h).to(torch.bfloat16)
-            a = F.scaled_dot_product_attention(q, k, qkv[2:3])  # [1, heads, t, d]; full attention over the image
+            qkv = F.linear(F.layer_norm(h, (WIDTH,), n1w, n1b, LN_EPS), qkv_w, qkv_b).view(t, 3, HEADS, d)
+            q, k, v = (t_.transpose(0, 1).unsqueeze(0) for t_ in qkv.permute(1, 0, 2, 3).unbind(0))  # [1, heads, t, d]
+            q, k = self._rope(q, cos, sin), self._rope(k, cos, sin)
+            a = F.scaled_dot_product_attention(q, k, v)  # full attention over the image; one frame = one segment
             h = h + F.linear(a[0].transpose(0, 1).reshape(t, WIDTH), proj_w, proj_b)
             h = h + F.linear(F.gelu(F.linear(F.layer_norm(h, (WIDTH,), n2w, n2b, LN_EPS), fc1_w, fc1_b),
                                     approximate="tanh"), fc2_w, fc2_b)
-        return self._merge(h, rows, cols)
+        return self._merge(h)
+
+    def _coords(self, rows: int, cols: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Each patch's (row, column) in spatial-merge-block sequence order."""
+        r = torch.arange(rows, device=self.device).view(-1, 1, MERGE, 1).expand(-1, cols // MERGE, MERGE, MERGE)
+        c = torch.arange(cols, device=self.device).view(1, -1, 1, MERGE).expand(rows // MERGE, -1, MERGE, MERGE)
+        return r.flatten(), c.flatten()
+
+    def _rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """[1, heads, t, d] under the axial rotary tables [t, d]: FP32 products, BF16 result, as the reference
+        rotates (half-turned pairs over the whole head)."""
+        cos, sin = cos[None, None].float(), sin[None, None].float()
+        f = x.float()
+        half = f.shape[-1] // 2
+        rot = torch.cat((-f[..., half:], f[..., :half]), dim=-1)
+        return (f * cos + rot * sin).to(x.dtype)
 
     @torch.inference_mode()
-    def _merge(self, h: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
-        """Tower features of a rows x cols raster grid -> the language model's embeddings, one per 2 x 2 patches."""
-        n = F.layer_norm(h, (WIDTH,), self.m_norm, self.m_norm_b, LN_EPS)
-        n = n.view(rows // MERGE, MERGE, cols // MERGE, MERGE, WIDTH).permute(0, 2, 1, 3, 4)
-        n = n.reshape(-1, MERGER_HIDDEN)
+    def _merge(self, h: torch.Tensor) -> torch.Tensor:
+        """Tower features in spatial-merge-block order -> the language model's embeddings, one per 2 x 2 patches
+        (consecutive there): LayerNorm(1152) a patch, then fc1 4608 -> erf GELU -> fc2 2560."""
+        n = F.layer_norm(h, (WIDTH,), self.m_norm, self.m_norm_b, LN_EPS).view(-1, MERGER_HIDDEN)
         n = F.gelu(F.linear(n, self.m_fc1_w, self.m_fc1_b))  # erf GELU, as the reference merger
         return F.linear(n, self.m_fc2_w, self.m_fc2_b)

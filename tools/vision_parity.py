@@ -41,7 +41,9 @@ def synthetic_images() -> list[tuple[str, np.ndarray]]:
     imgs = {
         "rects-640x480": (640, 480),
         "stripes-512x512": (512, 512),
-        "odd-817x353": (817, 353),   # forces rounding and the min-pixels clamp path
+        "odd-817x353": (817, 353),    # uneven rounding of both sides
+        "tiny-90x70": (90, 70),       # min-pixels clamp: 2880 px rounds up to 65536+
+        "wide-1520x400": (1520, 400), # extreme aspect, many blocks a row
     }
     for name, (w, h) in imgs.items():
         img = np.zeros((h, w, 3), np.uint8)
