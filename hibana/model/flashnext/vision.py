@@ -39,12 +39,26 @@ MIN_PIXELS, MAX_PIXELS = 65_536, 16_777_216  # preprocessor_config.json size sho
 FACTOR = PATCH * MERGE  # smart resize aligns sides to 32 pixels
 NORM_MEAN = NORM_STD = (0.5, 0.5, 0.5)
 VISION_BYTES = 1_100_000_000  # the tower and projector (BF16) as loaded: the load's headroom
-# One encode's device memory beyond its output (worst case a 16,384-patch image: qkv + rope temporaries). With room
-# for the allocator's blocks
-ENCODE_BYTES = 800 * 2**20
+# One encode's device memory beyond its output, MEASURED on GB10 (torch.cuda.max_memory_allocated around the
+# encode, Phase 3 tools/video_parity.py follow-up): 1,546 MiB for a worst-case 16,384-patch image, 1,618 MiB for a
+# worst-case frame pair (the same grid, one temporal step), at the allocator's blocks; 2 GiB with headroom
+ENCODE_BYTES = 2 * 2**30
+
+# ---- Video (Qwen3VLVideoProcessor semantics; video_preprocessor_config.json of the checkpoint) ----
+VIDEO_TOKEN = 248_057  # <|video_pad|> (config.json video_token_id)
+VIDEO_MIN_PIXELS, VIDEO_MAX_PIXELS = 4_096, 25_165_824  # size shortest/longest edge, *counting every frame's pixels*
+FRAME_MAX_PIXELS = 16_777_216 // 4  # per-frame cap (4,194,304 px: a 16,384-patch frame, the image worst case)
+SAMPLE_FPS = 2.0  # the processor's default fps sampling
+MIN_FRAMES = 4  # the processor's default (video_processing_qwen3_vl)
+MAX_FRAMES = int(__import__("os").environ.get("HIBANA_VIDEO_MAX_FRAMES", "32"))
+TS_TOKENS = 12  # safe upper bound of one `<123.4 seconds>` timestamp's tokens (admission accounting)
 
 # tokenizer_config.json of the checkpoint: <|image_pad|> (config.json image_token_id), <|vision_start|>, <|vision_end|>
 IMAGE_TOKEN, IMAGE_START, IMAGE_END = 248_056, 248_053, 248_054
+# The video path's own identity, part of every video pair's digest alongside `identity`.
+VIDEO_IDENTITY = b"flashnext qwen3-vl video: fps-2.0 uniform sampling, 4-32 frames (HIBANA_VIDEO_MAX_FRAMES), " \
+                  b"per-frame smart resize against a 25165824-pixel total budget, frame pairs (temporal_patch_size 2), " \
+                  b"<t seconds> timestamps between per-pair spans\n"
 # Part of every image's digest (api/media.py), so a cached or stored prefix is never resumed for pixels prepared
 # another way; change it with `preprocess`.
 IDENTITY = b"flashnext qwen3-vl tower: smart-resized to 32px-aligned sides of 65536-16777216 pixels, bicubic antialiased, 0.5/0.5 normalized, 16px patches raster, 2x2 merged\n"
@@ -83,6 +97,74 @@ def image_tokens(width: int, height: int) -> int:
     return gh * gw
 
 
+def video_size(num_frames: int, width: int, height: int) -> tuple[int, int]:
+    """(w, h) pixels each frame of a `num_frames`-frame clip is resized to: the video processor's `smart_resize` —
+    the frame count rounded to an even number (`temporal_patch_size`), sides to 32 pixels, and the *total* pixel
+    budget (every frame counted: `t_bar * h_bar * w_bar` against 25,165,824, plus a per-frame 4,194,304-pixel cap)
+    clamped from [4,096, ...]. ValueError for absurd aspect ratios."""
+    if num_frames < 1:
+        raise ValueError("a video needs at least one frame")
+    h, w = height, width
+    if h < FACTOR or w < FACTOR:  # the reference scales a too-small side up to the factor first
+        scale = max(FACTOR / h, FACTOR / w)
+        h, w = int(h * scale), int(w * scale)
+    if max(w, h) / min(w, h) > 200:
+        raise ValueError(f"absolute aspect ratio must be smaller than 200, got {max(w, h) / min(w, h)}")
+    t_bar = round(num_frames / TEMPORAL) * TEMPORAL
+    h_bar, w_bar = round(h / FACTOR) * FACTOR, round(w / FACTOR) * FACTOR
+    budget = min(VIDEO_MAX_PIXELS, FRAME_MAX_PIXELS * t_bar)
+    if t_bar * h_bar * w_bar > budget:
+        beta = math.sqrt((num_frames * h * w) / budget)
+        h_bar = max(FACTOR, math.floor(h / beta / FACTOR) * FACTOR)
+        w_bar = max(FACTOR, math.floor(w / beta / FACTOR) * FACTOR)
+    elif t_bar * h_bar * w_bar < VIDEO_MIN_PIXELS:
+        beta = math.sqrt(VIDEO_MIN_PIXELS / (num_frames * h * w))
+        h_bar = math.ceil(h * beta / FACTOR) * FACTOR
+        w_bar = math.ceil(w * beta / FACTOR) * FACTOR
+    return w_bar, h_bar
+
+
+def video_grid(num_frames: int, width: int, height: int) -> tuple[int, int, int]:
+    """(t, rows, cols): the temporal steps (frame pairs; an odd frame repeats its last, as the processor pads) and
+    every frame's merged patch grid after `video_size`. `t * rows * cols` is the clip's vision-token count, split
+    `rows * cols` a step across the prompt's per-step spans."""
+    t = (num_frames + TEMPORAL - 1) // TEMPORAL
+    w, h = video_size(num_frames, width, height)
+    return t, (h // PATCH) // MERGE, (w // PATCH) // MERGE
+
+
+def video_tokens(num_frames: int, width: int, height: int) -> int:
+    """The embeddings the clip's towers make (`video_grid`; ValueError as there). Timestamp text between the
+    per-step spans adds a few tokens a step, accounted where the prompt is built."""
+    t, rows, cols = video_grid(num_frames, width, height)
+    return t * rows * cols
+
+
+def sample_indices(total_frames: int, source_fps: float) -> list[int]:
+    """The frame indices a video of `total_frames` at `source_fps` is sampled to, uniformly (the processor's
+    `sample_frames` with its default fps 2.0): `int(total / fps * 2)` of them clamped to [4, HIBANA_VIDEO_MAX_FRAMES]
+    and to what exists, then `np.linspace(0, total - 1, n).round()` (repeats allowed)."""
+    if total_frames < 1:
+        raise ValueError("the video has no frames")
+    fps = source_fps if source_fps and source_fps > 0 else 24.0  # the processor's no-metadata default
+    n = int(total_frames / fps * SAMPLE_FPS)
+    n = min(max(n, MIN_FRAMES), MAX_FRAMES, total_frames)
+    return np.linspace(0, total_frames - 1, n).round().astype(int).tolist()
+
+
+def timestamps(indices: list[int], source_fps: float) -> list[float]:
+    """One timestamp a frame pair, in seconds: the processor pads an odd index list with its last index and takes
+    each pair's mean (`_calculate_timestamps`), the prompt writing `<t seconds>` before each pair's span."""
+    fps = source_fps if source_fps and source_fps > 0 else 24.0
+    idx = list(indices) + [indices[-1]] * (-len(indices) % TEMPORAL)
+    return [(idx[i] / fps + idx[i + TEMPORAL - 1] / fps) / 2 for i in range(0, len(idx), TEMPORAL)]
+
+
+def timestamp_text(seconds: float) -> str:
+    """The `<t seconds>` run the prompt places before each frame pair's span (the processor's `:.1f` format)."""
+    return f"<{seconds:.1f} seconds>"
+
+
 def preprocess(rgb: np.ndarray) -> torch.Tensor:
     """An RGB image [H, W, 3] uint8 as the tower's input: resized (bicubic, antialiased) to its smart-resized size and
     normalized (mean/std 0.5), [3, h, w] BF16 on the CPU, patches in raster order."""
@@ -94,11 +176,25 @@ def preprocess(rgb: np.ndarray) -> torch.Tensor:
     return ((t / 255.0 - mean) / std)[0].to(torch.bfloat16)
 
 
+def preprocess_pair(frames: np.ndarray, width: int, height: int) -> torch.Tensor:
+    """Two RGB frames [2, H, W, 3] uint8 as one temporal step's tower input: both resized (bicubic, antialiased,
+    per frame as the processor resizes a clip) to (`width`, `height`) = `video_size` of the clip they belong to and
+    normalized, [2, 3, h, w] BF16 on the CPU."""
+    t = torch.from_numpy(np.ascontiguousarray(frames)).permute(0, 3, 1, 2).to(torch.float32)  # [2, 3, H, W]
+    if t.shape[-2:] != (height, width):
+        t = F.interpolate(t, size=(height, width), mode="bicubic", align_corners=False, antialias=True)
+    mean, std = torch.tensor(NORM_MEAN).view(1, 3, 1, 1), torch.tensor(NORM_STD).view(1, 3, 1, 1)
+    return ((t / 255.0 - mean) / std).to(torch.bfloat16)  # [2, 3, h, w]
+
+
 class QwenVision:
     """The tower and projector on the device (engine/contracts.VisionEncoder); `encode` turns one preprocessed image
     into embeddings."""
 
     image_token, image_start, image_end, identity = IMAGE_TOKEN, IMAGE_START, IMAGE_END, IDENTITY
+    video_token = VIDEO_TOKEN  # video input: the pairs of `encode_pair` fill <|video_pad|> spans (api/media.py)
+    video_identity = VIDEO_IDENTITY
+    video_token_text = "<|video_pad|>"
     # The checkpoint's chat template writes `<|vision_start|><|image_pad|><|vision_end|>` for an image
     # part itself (the Qwen convention), not a `<image>` marker: api/media.py escapes these strings in
     # the request's own text and `expand` replaces the pad token between the start and end it placed.
@@ -108,6 +204,13 @@ class QwenVision:
     preprocess = staticmethod(preprocess)
     tokens = staticmethod(image_tokens)
     grid = staticmethod(image_grid)
+    preprocess_pair = staticmethod(preprocess_pair)
+
+    @staticmethod
+    def preprocess_pair_grid(frames: np.ndarray, grid: tuple[int, int]) -> torch.Tensor:
+        """A pair's frames resized to the clip's target: the merged grid (rows, cols) the API recorded on the
+        pair's `Image` says it (32 pixels a cell)."""
+        return preprocess_pair(frames, grid[1] * FACTOR, grid[0] * FACTOR)
 
     def __init__(self, w, device: torch.device):
         def get(name: str) -> torch.Tensor:
@@ -210,6 +313,40 @@ class QwenVision:
         half = f.shape[-1] // 2
         rot = torch.cat((-f[..., half:], f[..., :half]), dim=-1)
         return (f * cos + rot * sin).to(x.dtype)
+
+    @staticmethod
+    def _frame_patches(x: torch.Tensor) -> torch.Tensor:
+        """One frame [3, H, W] -> its patches [H/16 * W/16, 3, 16, 16] in the reference's spatial-merge-block order
+        ((C, h/2, 2, 16, w/2, 2, 16) -> (h/2, w/2, 2, 2, C, 16, 16))."""
+        rows, cols = x.shape[1] // PATCH, x.shape[2] // PATCH
+        return x.reshape(3, rows // MERGE, MERGE, PATCH, cols // MERGE, MERGE, PATCH) \
+            .permute(1, 4, 2, 5, 0, 3, 6).reshape(-1, 3, PATCH, PATCH)
+
+    @torch.inference_mode()
+    def encode_pair(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Two consecutive frames [2, 3, H, W] (`preprocess_pair`, one temporal step) -> [H/16 * W/16 / 4, 2560]
+        embeddings: the patch Conv3d over the *pair* (its two temporal slices), then per-frame attention (this pair
+        is one `h * w`-patch segment, as `get_vision_cu_seqlens` segments a clip a frame pair) with the per-frame
+        position table and axial rotary (every frame of a clip shares them, `get_vision_position_ids` repeating the
+        2-axis ids t times), and the merger. `encode_pair(f, f)` is `encode(f)` bitwise (the image path feeds the
+        same patches twice)."""
+        x0, x1 = (p.to(self.device, torch.bfloat16) for p in pixels)
+        rows, cols = x0.shape[1] // PATCH, x0.shape[2] // PATCH
+        p0, p1 = self._frame_patches(x0), self._frame_patches(x1)
+        patches = torch.stack((p0, p1), dim=2).contiguous()  # [N, 3, 2, 16, 16]: slice 0 frame f, slice 1 frame f+1
+        h = F.conv3d(patches, self.patch, self.patch_bias).reshape(-1, WIDTH) \
+            + self._pos_embeds(*self._coords(rows, cols)).to(torch.bfloat16)
+        cos, sin = self._cos_sin(*self._coords(rows, cols))
+        t, d = h.shape[0], self.head_dim
+        for n1w, n1b, qkv_w, qkv_b, proj_w, proj_b, n2w, n2b, fc1_w, fc1_b, fc2_w, fc2_b in self.blocks:
+            qkv = F.linear(F.layer_norm(h, (WIDTH,), n1w, n1b, LN_EPS), qkv_w, qkv_b).view(t, 3, HEADS, d)
+            q, k, v = (t_.transpose(0, 1).unsqueeze(0) for t_ in qkv.permute(1, 0, 2, 3).unbind(0))
+            q, k = self._rope(q, cos, sin), self._rope(k, cos, sin)
+            a = F.scaled_dot_product_attention(q, k, v)  # this pair's patches: one full-attention segment
+            h = h + F.linear(a[0].transpose(0, 1).reshape(t, WIDTH), proj_w, proj_b)
+            h = h + F.linear(F.gelu(F.linear(F.layer_norm(h, (WIDTH,), n2w, n2b, LN_EPS), fc1_w, fc1_b),
+                                    approximate="tanh"), fc2_w, fc2_b)
+        return self._merge(h)
 
     @torch.inference_mode()
     def _merge(self, h: torch.Tensor) -> torch.Tensor:
