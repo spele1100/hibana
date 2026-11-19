@@ -253,6 +253,8 @@ class FlashNext:
         if ctx.mode == "prefill":
             prepare_gdn_prefill(ctx, len(input_ids), input_ids.device)
         x = torch.nn.functional.embedding(input_ids, self.embed)
+        if ctx.media_rows is not None:  # an image's placeholder rows read its encoder output (engine/media.py)
+            x.index_copy_(0, ctx.media_rows, ctx.media_embeds)
         hyper = torch.cat([x] * self.target.hc_count, dim=-1)
         ctx.capture = capture
         out: dict = {"input_ids": input_ids, "positions": ctx.positions}

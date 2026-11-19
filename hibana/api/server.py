@@ -159,7 +159,7 @@ def create_app(engine: EngineLoop, tok: SnapshotTokenizer, tmpl: ChatTemplate, d
         images = []
         if vision is not None:
             folded, images = await asyncio.to_thread(media.prepare, folded, vision, decode)
-            folded, tools = media.escape(folded), media.escape(tools)
+            folded, tools = media.escape(folded, vision), media.escape(tools, vision)
         head = ""  # rendered before the full prompt: the template's last render is the one tests and logs look at
         if boundary and len(folded) > 1:
             with contextlib.suppress(Exception):  # a template that rejects a partial conversation: no boundary

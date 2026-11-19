@@ -99,6 +99,11 @@ class QwenVision:
     into embeddings."""
 
     image_token, image_start, image_end, identity = IMAGE_TOKEN, IMAGE_START, IMAGE_END, IDENTITY
+    # The checkpoint's chat template writes `<|vision_start|><|image_pad|><|vision_end|>` for an image
+    # part itself (the Qwen convention), not a `<image>` marker: api/media.py escapes these strings in
+    # the request's own text and `expand` replaces the pad token between the start and end it placed.
+    template_tokens = True
+    image_token_text, image_start_text, image_end_text = "<|image_pad|>", "<|vision_start|>", "<|vision_end|>"
     workspace_bytes = ENCODE_BYTES
     preprocess = staticmethod(preprocess)
     tokens = staticmethod(image_tokens)

@@ -27,8 +27,22 @@ from hibana.engine.sampler import InvalidRequest
 IMAGE_PARTS = ("image_url", "input_image", "image")
 MAX_IMAGE_BYTES = 32 * 2**20  # an encoded image
 MAX_IMAGES = 100  # in one request (Anthropic's limit); their tokens are bounded by the context
-MARKER = "<image>"  # what the template writes for an image part
+MARKER = "<image>"  # what a marker-convention template writes for an image part
 _ESCAPED = "image>"  # a "<image>" of the request's own text while it is rendered (a private-use character for "<")
+_PRIVATE = ""  # a template's own image tokens in the request's text are escaped the same way, first char swapped
+
+
+def _protected(vision) -> tuple[tuple[str, str], ...]:
+    """(the string, its escaped stand-in) for everything that places an image in a render: the
+    marker, and — for a token-convention encoder (`VisionEncoder.template_tokens`: Flash-Next's
+    Qwen template writes `<|vision_start|><|image_pad|><|vision_end|>` itself) — the token
+    strings, so a request's own text never places an image."""
+    pairs = [(MARKER, _ESCAPED)]
+    for name in ("image_token_text", "image_start_text", "image_end_text"):
+        text = getattr(vision, name, None)
+        if text:
+            pairs.append((text, _PRIVATE + text[1:]))
+    return tuple(pairs)
 _DECODED: dict[bytes, None] = {}  # digests of images that decoded here: a repeat is not decoded again to check it
 
 
@@ -115,14 +129,18 @@ def prepare(messages: list[dict], vision, decode: bool = True) -> tuple[list[dic
     return out, images
 
 
-def escape(value):
-    """`value` (messages or tools, at any nesting) with "<image>" in its strings escaped for the render."""
+def escape(value, vision=None):
+    """`value` (messages or tools, at any nesting) with every image-placing string of its text
+    escaped for the render (`_protected`); `vision` None keeps the marker alone."""
+    pairs = _protected(vision) if vision is not None else ((MARKER, _ESCAPED),)
     if isinstance(value, str):
-        return value.replace(MARKER, _ESCAPED)
+        for plain, escaped in pairs:
+            value = value.replace(plain, escaped)
+        return value
     if isinstance(value, list):
-        return [escape(v) for v in value]
+        return [escape(v, vision) for v in value]
     if isinstance(value, dict):
-        return {k: escape(v) for k, v in value.items()}
+        return {k: escape(v, vision) for k, v in value.items()}
     return value
 
 
@@ -133,7 +151,13 @@ class Markers:
 
     def __init__(self, tok, vision):
         self.image_token = vision.image_token
-        self.text = tok.without_specials({vision.image_token, vision.image_start, vision.image_end})
+        # The marker's escape is undone to the marker (encoded as text); a token string's escape
+        # stays, so the request's own `<|image_pad|>` never encodes as the token that places an image.
+        self.undo = {escaped: (plain if plain == MARKER else escaped) for plain, escaped in _protected(vision)}
+        # A marker-convention template writes `<image>` where an image goes and the token strings must
+        # stay text; a token-convention template (Flash-Next) writes the tokens themselves.
+        self.text = tok if getattr(vision, "template_tokens", False) \
+            else tok.without_specials({vision.image_token, vision.image_start, vision.image_end})
 
     def encode_with_offsets(self, text: str) -> tuple[list[int], list[tuple[int, int]]]:
         ids, offsets, at = [], [], 0
@@ -142,7 +166,9 @@ class Markers:
                 ids.append(self.image_token)
                 offsets.append((at, at + len(MARKER)))
                 at += len(MARKER)
-            piece_ids, piece_offsets = self.text.encode_with_offsets(piece.replace(_ESCAPED, MARKER))
+            for escaped, plain in self.undo.items():
+                piece = piece.replace(escaped, plain)
+            piece_ids, piece_offsets = self.text.encode_with_offsets(piece)
             ids += piece_ids
             offsets += [(a + at, b + at) for a, b in piece_offsets]
             at += len(piece)
@@ -163,13 +189,23 @@ def expand(ids: list[int], boundary: int, images: list[Prepared], vision) -> tup
     moved, last = boundary, 0
     for mark, image in zip(marks, images):
         out += ids[last:mark]
-        out.append(vision.image_start)
+        # A token-convention template (Flash-Next) writes `<|vision_start|><|image_pad|><|vision_end|>`
+        # itself: the pad token between the start the render already placed and its end, which is
+        # then the next id; a marker-convention template gets both added here.
+        opens = bool(out) and out[-1] == vision.image_start
+        closes = opens and mark + 1 < len(ids) and ids[mark + 1] == vision.image_end
+        if not opens:
+            out.append(vision.image_start)
         engine_images.append(media.Image(start=len(out), ids=media.placeholder_ids(image.digest, image.tokens), data=image.data,
                                          grid=image.grid))
         out += engine_images[-1].ids
-        out.append(vision.image_end)
-        last = mark + 1
+        if closes:
+            out.append(vision.image_end)
+            last = mark + 2
+        else:
+            out.append(vision.image_end)
+            last = mark + 1
         if boundary and mark < boundary:
-            moved += image.tokens + 1
+            moved += image.tokens + (1 if not closes else -1)
     out += ids[last:]
     return out, moved, tuple(engine_images)
