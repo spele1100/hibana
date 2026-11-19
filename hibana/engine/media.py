@@ -42,6 +42,7 @@ class Image:
     pixels: Future | None = None  # the encoder's input, being made on the worker thread
     embeds: torch.Tensor | None = None  # [len(ids), hidden], from its encode until its span is prefilled
     encoded: torch.cuda.Event | None = None  # recorded on the side stream after the encode, until a prefill waits on it
+    grid: tuple[int, int] | None = None  # the encoder's merged patch grid (rows, cols); multimodal-RoPE targets read it
 
     @property
     def end(self) -> int:

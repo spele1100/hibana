@@ -69,10 +69,18 @@ def target_size(width: int, height: int, min_pixels: int = MIN_PIXELS, max_pixel
     return w, h
 
 
+def image_grid(width: int, height: int) -> tuple[int, int]:
+    """The merged patch grid ``(rows, cols)`` an image of this size becomes (`target_size`); its
+    rows x cols is the placeholder count, and the language model's multimodal RoPE gives each
+    placeholder the grid coordinates of its merged token (model/flashnext/mrope.py)."""
+    w, h = target_size(width, height)
+    return (h // PATCH) // MERGE, (w // PATCH) // MERGE
+
+
 def image_tokens(width: int, height: int) -> int:
     """The embeddings `encode` makes of a `width` x `height` image (`target_size`; ValueError as there)."""
-    w, h = target_size(width, height)
-    return (h // PATCH) * (w // PATCH) // MERGE**2
+    gh, gw = image_grid(width, height)
+    return gh * gw
 
 
 def preprocess(rgb: np.ndarray) -> torch.Tensor:
@@ -94,6 +102,7 @@ class QwenVision:
     workspace_bytes = ENCODE_BYTES
     preprocess = staticmethod(preprocess)
     tokens = staticmethod(image_tokens)
+    grid = staticmethod(image_grid)
 
     def __init__(self, w, device: torch.device):
         def get(name: str) -> torch.Tensor:

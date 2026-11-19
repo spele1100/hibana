@@ -37,6 +37,7 @@ class Prepared:
     digest: bytes  # SHA-256 of the encoder's identity and the encoded bytes
     tokens: int  # the embeddings it becomes
     data: bytes  # the encoded image
+    grid: tuple[int, int] | None = None  # the encoder's merged patch grid, for multimodal-RoPE positions
 
 
 def image_bytes(part: dict) -> bytes:
@@ -80,7 +81,8 @@ def _read(part: dict, vision, seen: dict[bytes, Prepared], decode: bool) -> Prep
             if len(_DECODED) >= 4096:
                 _DECODED.clear()
             _DECODED[digest] = None
-        seen[digest] = Prepared(digest, tokens, raw)
+        grid = vision.grid(*media.size(raw)) if hasattr(vision, "grid") else None
+        seen[digest] = Prepared(digest, tokens, raw, grid)
     return seen[digest]
 
 
@@ -162,7 +164,8 @@ def expand(ids: list[int], boundary: int, images: list[Prepared], vision) -> tup
     for mark, image in zip(marks, images):
         out += ids[last:mark]
         out.append(vision.image_start)
-        engine_images.append(media.Image(start=len(out), ids=media.placeholder_ids(image.digest, image.tokens), data=image.data))
+        engine_images.append(media.Image(start=len(out), ids=media.placeholder_ids(image.digest, image.tokens), data=image.data,
+                                         grid=image.grid))
         out += engine_images[-1].ids
         out.append(vision.image_end)
         last = mark + 1
