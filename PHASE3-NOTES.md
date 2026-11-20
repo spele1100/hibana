@@ -10,7 +10,7 @@ production TensorFold stopped and restored cleanly (200 OK, 262144 ctx).
 ## The semantics found (the load-bearing discovery)
 
 **Qwen3-VL's video prompt is not one big pad span.** The processor (`replace_video_token`, transformers 5.15.1) and
-the deployed vLLM flash-next build (`get_video_repl`, `/home/bot/q4exp-ref/vllm_qwen3_vl.py`) both write, per
+the deployed vLLM flash-next build (`get_video_repl`, `vllm_qwen3_vl.py` (in the vLLM reference sources)) both write, per
 *temporal step* (frame pair, `temporal_patch_size` 2): a text timestamp `<12.4 seconds>`, then
 `<|vision_start|>` + that pair's `rows*cols` `<|video_pad|>` tokens + `<|vision_end|>`. And `get_rope_index` splits a
 video's grid into per-frame (t=1) grids — **each pair's span gets exactly image positions**, text (the timestamps)

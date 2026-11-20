@@ -14,7 +14,7 @@ production container at ~7 GiB free GPU).
   `model-bf16-00001.safetensors`, BF16, quantizer excludes the tower), builds the spike tower + the transformers
   reference on the same tensors, runs 5 synthetic images (rectangles/gradients/text-like stripes; nothing
   downloaded), compares merged embeddings [N, 2560]. Also verifies the patch-grid token math per image.
-- Branch `flashnext-vision` in `/home/bot/hibana-vision-fork` (GB10) and `~/research/hibana-vision-fork` (claw).
+- Branch `flashnext-vision` in the fork checkout.
 
 ## Architecture found (Qwen4Exp vision = Qwen3-VL vision tower)
 
@@ -82,7 +82,7 @@ sizes (incl. clamp paths). Vision tensors: 861 MiB as loaded.
 1. **MRoPE**: flashnext text rope is sections [11,11,10]-interleaved over 32 freq slots (Qwen3.5 3-D rule; text
    collapses to 1-D). `hibana/model/rope.py` currently implements plain partial rotary — needs an mrope variant
    fed per-token (t, h, w) positions; vision tokens take the image's grid coords (per merged token: block center
-   convention — check vLLM's `get_mrope_input_positions` in the copied reference `/home/bot/q4exp-ref/`).
+   convention — check vLLM's `get_mrope_input_positions` in the copied vLLM reference sources).
 2. Engine wiring: `VisionEncoder` protocol attrs are all present; media path replaces `image_token` rows with
    `encode(preprocess(rgb))` between start/end tokens (existing generic media machinery).
 3. Model loading: the visual tensors all sit in one shard (`model-bf16-00001.safetensors`) — the spike's
@@ -90,11 +90,11 @@ sizes (incl. clamp paths). Vision tensors: 861 MiB as loaded.
    nemotron's `model.vision` attribute).
 4. Decide the resize kernel (torch vs PIL) and whether `identity` string needs changing with it.
 5. Measure `workspace_bytes`, add vision tensors to the load's headroom accounting (~0.9 GiB).
-6. Optionally reuse `/home/bot/q4exp-ref/` (vLLM's flash-next + qwen3_vl modeling sources, extracted from the
-   docker image) for the MRoPE position layout — it is already on GB10.
+6. Optionally reuse the vLLM flash-next + qwen3_vl modeling sources (extracted from the
+   docker image) for the MRoPE position layout.
 
 ## LOC
 
 - `vision.py` 206 lines (incl. module docstring); `vision_parity.py` 138; both committed on branch
-  `flashnext-vision` (GB10 fork `/home/bot/hibana-vision-fork`, claw mirror `~/research/hibana-vision-fork`).
+  `flashnext-vision` (the fork checkout).
   Nothing pushed anywhere.

@@ -15,7 +15,7 @@ vLLM semantics, both documented below.
   by merged-grid raster order; `pos_delta = H·W − max(H,W)` behind the token count).
 - `kernels/qk_norm_rope.py`: multimodal Triton kernel — rotary pair `p` reads the position of axis
   `p % 3` (t/h/w), the interleaved layout of the deployed flash-next build's own kernels
-  (`/home/bot/q4exp-ref/nvidia/ops/qsa_pre_indexer.py`: `h_mask = (pairs % 3 == 1) & (pairs <=
+  (`qsa_pre_indexer.py` (in the vLLM reference sources): `h_mask = (pairs % 3 == 1) & (pairs <=
   3·MROPE_H)`, sections [11, 11, 10] over 32 pairs). **Text rows through it are bitwise the
   original kernel** (`tools/mrope_check.py`: `torch.equal` on q and k); image rows match a torch
   reference of the layout (k bitwise, q within one BF16 ulp at large angles).

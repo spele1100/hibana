@@ -5,7 +5,7 @@ The language model's rotary pairs (32 of them: rotary_dim 64, NeoX halves) are s
 three position axes **interleaved** — pair ``p`` belongs to axis ``p % 3`` (t, h, w), which for
 the checkpoint's ``mrope_section`` ``[11, 11, 10]`` gives exactly 11 t-, 11 h- and 10 w-pairs
 (pairs 0,3,…,30 / 1,4,…,31 / 2,5,…,29). This is the layout of the deployed vLLM flash-next
-build's kernels (the reference sources under ``/home/bot/q4exp-ref``: the QSA pre-indexer's
+build's kernels (the extracted vLLM reference sources: the QSA pre-indexer's
 ``h_mask = (pairs % 3 == 1) & …`` masks, with cos/sin still read from the same position-major
 table), so a text row, whose three components are equal, is plain RoPE — bitwise the existing
 ``PartialRotary`` table lookup.

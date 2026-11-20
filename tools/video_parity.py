@@ -35,7 +35,7 @@ from hibana.model.flashnext.vision import (FRAME_MAX_PIXELS, MERGE, PATCH, QwenV
 from hibana.weights.safetensors import SnapshotWeights  # noqa: E402
 
 SNAPSHOT = Path(sys.argv[1] if len(sys.argv) > 1 else
-                "/home/bot/hibana-models/hub/models--RadixArk--Qwen3.8-Flash-Next-NVFP4/snapshots/"
+                "~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-Flash-Next-NVFP4/snapshots/"
                 "7b719225242aacd3dbd3f9407468c2ee9a9d2594")
 
 
